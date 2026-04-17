@@ -7,6 +7,7 @@ cc_binary {
     srcs: [
         "main.cpp",
         "container_manager.cpp",
+        "cgroup_controller.cpp",
         "session.cpp",
         "tar_gz_extract.cpp",
     ],
@@ -23,4 +24,11 @@ cc_binary {
         "-Werror",
         "-Wno-unused-parameter",
     ],
+}
+
+prebuilt_etc {
+    name: "aohp_cgroup_conf",
+    src: "cgroup.conf",
+    sub_dir: "aohp",
+    filename: "cgroup.conf",
 }

@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "cgroup_controller.h"
+
 namespace aohp {
 
 struct ExecResult {
@@ -30,26 +32,49 @@ public:
     bool resetContainer(const std::string& name);
     ExecResult execSync(const std::string& name, const std::string& command, int timeoutMs);
 
-    // Returns master PTY fd for interactive shell, -1 on error.
     int openShell(const std::string& name);
 
-    /** Non-empty after createContainer() returns false (diagnostics for clients). */
     const std::string& getLastError() const { return mLastError_; }
+
+    std::string templateInfo(const std::string& name);
+
+    long startService(const std::string& name, const std::string& serviceId, const std::string& command);
+    bool stopService(const std::string& name, const std::string& serviceId);
+    std::string listServicesJson(const std::string& name);
+    std::string serviceLogTail(const std::string& name, const std::string& serviceId, int tailBytes);
+    std::string getUsageJson(const std::string& name);
+    std::string diagnose(const std::string& name);
+
+    /** Remove stale .pid files when the child died externally; call at daemon startup. */
+    void adoptOrphanServicePids();
+
+    CgroupController& cgroup() { return mCgroup_; }
 
 private:
     std::string mLastError_;
     std::mutex mWorkDirMutex_;
     std::map<std::string, std::string> mWorkDir_;
 
+    CgroupController mCgroup_;
+
     std::string rootfsPath(const std::string& name);
     std::string envPath(const std::string& name);
     std::string templatePath(const std::string& templateName);
+    std::string templateRecordPath(const std::string& name);
+    std::string servicesDirPath(const std::string& name);
 
     bool extractTemplate(const std::string& templateTarGz, const std::string& destDir);
     bool setupBindMounts(const std::string& rootfs);
     bool teardownBindMounts(const std::string& rootfs);
     void killContainerProcesses(const std::string& rootfs);
-    int forkIntoContainer(const std::string& rootfs, const char* const argv[], bool usePty);
+    int forkIntoContainer(const std::string& containerName, const std::string& rootfs,
+                          const char* const argv[], bool usePty);
+
+    bool writeTemplateRecord(const std::string& name, const std::string& templateName);
+    std::string readTemplateRecord(const std::string& name);
+    std::string firstTemplateTarInTemplateDir();
+
+    static bool isValidServiceId(const std::string& id);
 };
 
 }  // namespace aohp

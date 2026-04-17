@@ -30,6 +30,18 @@ constexpr const char* RESP_ERR = "ERR";
 
 constexpr const char* CONTAINER_BASE_DIR = "/data/aohp/envs";
 constexpr const char* TEMPLATE_DIR       = "/system/etc/aohp/rootfs-templates";
+constexpr const char* SHARED_BASE           = "/data/aohp/shared";
+constexpr const char* SHARED_NPM_CACHE      = "/data/aohp/shared/npm-cache";
+constexpr const char* SHARED_OPENCLAW_DEV   = "/data/aohp/shared/openclaw-dev";
+constexpr const char* AOHP_CGROUP_CONF      = "/system/etc/aohp/cgroup.conf";
+
+constexpr const char* CMD_TEMPLATE_INFO = "TEMPLATE_INFO";
+constexpr const char* CMD_START_SVC     = "START_SVC";
+constexpr const char* CMD_STOP_SVC      = "STOP_SVC";
+constexpr const char* CMD_LIST_SVC      = "LIST_SVC";
+constexpr const char* CMD_SVC_LOG       = "SVC_LOG";
+constexpr const char* CMD_USAGE         = "USAGE";
+constexpr const char* CMD_DIAG          = "DIAG";
 
 inline std::vector<std::string> splitLine(const std::string& line) {
     std::vector<std::string> tokens;

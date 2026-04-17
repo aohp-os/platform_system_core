@@ -14,7 +14,10 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <sstream>
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <pty.h>
@@ -33,7 +36,8 @@ namespace aohp {
 
 namespace {
 
-// Create every directory component of an absolute path (excluding the final leaf if it is a file path).
+constexpr int64_t kLogRotateBytes = 10 * 1024 * 1024;
+
 bool mkdirParentsAbsolute(const std::string& path, mode_t mode) {
     if (path.empty() || path[0] != '/') return false;
     size_t pos = 0;
@@ -62,18 +66,75 @@ bool ensureDir(const std::string& path, mode_t mode) {
     return true;
 }
 
-// CLONE_NEWPID|CLONE_NEWNS often returns EINVAL on Android (threads / policy). Mount namespace alone
-// is enough to avoid littering the global mount table when bind-mounting before chroot.
 void tryUnshareMountNs() {
     if (unshare(CLONE_NEWNS) != 0) {
         PLOG(WARNING) << "unshare(CLONE_NEWNS) failed, using host mount namespace";
     }
 }
 
+std::string jsonEscape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '\\':
+                o += "\\\\";
+                break;
+            case '"':
+                o += "\\\"";
+                break;
+            case '\n':
+                o += "\\n";
+                break;
+            case '\r':
+                o += "\\r";
+                break;
+            case '\t':
+                o += "\\t";
+                break;
+            default:
+                o += c;
+                break;
+        }
+    }
+    return o;
+}
+
+std::string extractJsonStringField(const std::string& j, const char* key) {
+    std::string pat = std::string("\"") + key + "\":\"";
+    size_t p = j.find(pat);
+    if (p == std::string::npos) return "";
+    p += pat.size();
+    std::string o;
+    while (p < j.size()) {
+        if (j[p] == '\\' && p + 1 < j.size()) {
+            o += j[p + 1];
+            p += 2;
+            continue;
+        }
+        if (j[p] == '"') break;
+        o += j[p++];
+    }
+    return o;
+}
+
+long long extractJsonIntField(const std::string& j, const char* key) {
+    std::string pat = std::string("\"") + key + "\":";
+    size_t p = j.find(pat);
+    if (p == std::string::npos) return 0;
+    p += pat.size();
+    while (p < j.size() && (j[p] == ' ' || j[p] == '\t')) ++p;
+    return strtoll(j.c_str() + p, nullptr, 10);
+}
+
 }  // namespace
 
 ContainerManager::ContainerManager() {
     mkdir(CONTAINER_BASE_DIR, 0770);
+    mkdir(SHARED_BASE, 0770);
+    mkdir(SHARED_NPM_CACHE, 0770);
+    mkdir(SHARED_OPENCLAW_DEV, 0770);
+    mCgroup_.loadConfig(AOHP_CGROUP_CONF);
 }
 
 std::string ContainerManager::envPath(const std::string& name) {
@@ -86,6 +147,52 @@ std::string ContainerManager::rootfsPath(const std::string& name) {
 
 std::string ContainerManager::templatePath(const std::string& templateName) {
     return std::string(TEMPLATE_DIR) + "/" + templateName + ".tar.gz";
+}
+
+std::string ContainerManager::templateRecordPath(const std::string& name) {
+    return envPath(name) + "/.template";
+}
+
+std::string ContainerManager::servicesDirPath(const std::string& name) {
+    return envPath(name) + "/services";
+}
+
+bool ContainerManager::writeTemplateRecord(const std::string& name, const std::string& templateName) {
+    std::string path = templateRecordPath(name);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        PLOG(ERROR) << "writeTemplateRecord " << path;
+        return false;
+    }
+    write(fd, templateName.data(), templateName.size());
+    write(fd, "\n", 1);
+    close(fd);
+    return true;
+}
+
+std::string ContainerManager::readTemplateRecord(const std::string& name) {
+    std::string path = templateRecordPath(name);
+    std::ifstream in(path.c_str());
+    if (!in) return "";
+    std::string line;
+    if (!std::getline(in, line)) return "";
+    return android::base::Trim(line);
+}
+
+std::string ContainerManager::firstTemplateTarInTemplateDir() {
+    DIR* dir = opendir(TEMPLATE_DIR);
+    if (!dir) return "";
+    std::string tpl;
+    struct dirent* e;
+    while ((e = readdir(dir)) != nullptr) {
+        std::string fn(e->d_name);
+        if (fn.size() > 7 && fn.substr(fn.size() - 7) == ".tar.gz") {
+            tpl = std::string(TEMPLATE_DIR) + "/" + fn;
+            break;
+        }
+    }
+    closedir(dir);
+    return tpl;
 }
 
 std::vector<std::string> ContainerManager::listContainers() {
@@ -106,8 +213,7 @@ std::vector<std::string> ContainerManager::listContainers() {
     return result;
 }
 
-bool ContainerManager::extractTemplate(const std::string& templateTarGz,
-                                       const std::string& destDir) {
+bool ContainerManager::extractTemplate(const std::string& templateTarGz, const std::string& destDir) {
     std::string err;
     if (!extractTarGz(templateTarGz, destDir, &err)) {
         mLastError_ = err.empty() ? "template extract failed" : err;
@@ -117,8 +223,7 @@ bool ContainerManager::extractTemplate(const std::string& templateTarGz,
     return true;
 }
 
-bool ContainerManager::createContainer(const std::string& name,
-                                       const std::string& templateName) {
+bool ContainerManager::createContainer(const std::string& name, const std::string& templateName) {
     mLastError_.clear();
     std::string env = envPath(name);
     std::string rootfs = rootfsPath(name);
@@ -147,7 +252,6 @@ bool ContainerManager::createContainer(const std::string& name,
         return false;
     }
 
-    // Ensure mount points exist inside rootfs.
     mkdir((rootfs + "/proc").c_str(), 0555);
     mkdir((rootfs + "/dev").c_str(), 0755);
     mkdir((rootfs + "/dev/pts").c_str(), 0755);
@@ -155,13 +259,21 @@ bool ContainerManager::createContainer(const std::string& name,
     mkdir((rootfs + "/sdcard").c_str(), 0755);
     mkdir((rootfs + "/tmp").c_str(), 01777);
 
-    // Create /etc/resolv.conf so DNS works inside the container.
     std::string resolv = rootfs + "/etc/resolv.conf";
     int fd = open(resolv.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         const char* dns = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
         write(fd, dns, strlen(dns));
         close(fd);
+    }
+
+    if (!writeTemplateRecord(name, templateName)) {
+        mLastError_ = "failed to write .template record";
+        return false;
+    }
+
+    if (!mCgroup_.createForContainer(name)) {
+        LOG(WARNING) << "cgroup create failed for " << name << " (continuing without limits)";
     }
 
     LOG(INFO) << "Container " << name << " created from template " << templateName;
@@ -194,7 +306,6 @@ static int removePathRecursive(const std::string& path) {
 static int recursiveRemove(const std::string& path) { return removePathRecursive(path); }
 
 void ContainerManager::killContainerProcesses(const std::string& rootfs) {
-    // Best-effort: scan /proc for processes whose root link points into our rootfs.
     DIR* proc = opendir("/proc");
     if (!proc) return;
     struct dirent* entry;
@@ -214,13 +325,21 @@ void ContainerManager::killContainerProcesses(const std::string& rootfs) {
         }
     }
     closedir(proc);
-    usleep(100000);  // 100ms grace
+    usleep(100000);
 }
 
 bool ContainerManager::teardownBindMounts(const std::string& rootfs) {
-    const char* mounts[] = {"/proc", "/dev/pts", "/dev", "/sys", "/sdcard"};
+    const char* mounts[] = {
+            "/opt/openclaw-dev",
+            "/root/.npm",
+            "/proc",
+            "/dev/pts",
+            "/dev",
+            "/sys",
+            "/sdcard",
+    };
     bool ok = true;
-    for (int i = sizeof(mounts) / sizeof(mounts[0]) - 1; i >= 0; --i) {
+    for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); ++i) {
         std::string target = rootfs + mounts[i];
         if (umount2(target.c_str(), MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
             PLOG(WARNING) << "umount " << target;
@@ -240,6 +359,7 @@ bool ContainerManager::destroyContainer(const std::string& name) {
 
     killContainerProcesses(rootfs);
     teardownBindMounts(rootfs);
+    mCgroup_.destroyForContainer(name);
 
     if (recursiveRemove(env) != 0) {
         LOG(ERROR) << "Failed to remove " << env;
@@ -261,19 +381,18 @@ bool ContainerManager::resetContainer(const std::string& name) {
     teardownBindMounts(rootfs);
     recursiveRemove(rootfs);
 
-    // Re-discover template: look for first .tar.gz in TEMPLATE_DIR.
     std::string tpl;
-    DIR* dir = opendir(TEMPLATE_DIR);
-    if (dir) {
-        struct dirent* e;
-        while ((e = readdir(dir)) != nullptr) {
-            std::string fn(e->d_name);
-            if (fn.size() > 7 && fn.substr(fn.size() - 7) == ".tar.gz") {
-                tpl = std::string(TEMPLATE_DIR) + "/" + fn;
-                break;
-            }
+    std::string recorded = readTemplateRecord(name);
+    if (!recorded.empty()) {
+        tpl = templatePath(recorded);
+        struct stat st;
+        if (stat(tpl.c_str(), &st) != 0) {
+            LOG(WARNING) << "recorded template missing, falling back: " << tpl;
+            tpl.clear();
         }
-        closedir(dir);
+    }
+    if (tpl.empty()) {
+        tpl = firstTemplateTarInTemplateDir();
     }
     if (tpl.empty()) {
         LOG(ERROR) << "No template found for reset";
@@ -299,6 +418,9 @@ bool ContainerManager::resetContainer(const std::string& name) {
         close(fd);
     }
 
+    mCgroup_.destroyForContainer(name);
+    mCgroup_.createForContainer(name);
+
     LOG(INFO) << "Container " << name << " reset";
     return true;
 }
@@ -318,32 +440,44 @@ bool ContainerManager::setupBindMounts(const std::string& rootfs) {
     if (!doMount("/dev", "/dev", 0)) return false;
     if (!doMount("/sys", "/sys", MS_RDONLY)) return false;
 
-    // Mount devpts for PTY support inside the container.
     std::string devpts = rootfs + "/dev/pts";
     if (!ensureDir(devpts, 0755)) return false;
     if (mount("devpts", devpts.c_str(), "devpts", 0, "newinstance,ptmxmode=0666") != 0) {
         PLOG(WARNING) << "devpts mount failed (PTY in container may not work)";
     }
 
-    // Bind /sdcard (FUSE-backed on modern Android).
     struct stat st;
     if (stat("/sdcard", &st) == 0) {
         doMount("/sdcard", "/sdcard", 0);
     } else if (stat("/storage/emulated/0", &st) == 0) {
         doMount("/storage/emulated/0", "/sdcard", 0);
     }
+
+    if (stat(SHARED_NPM_CACHE, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (ensureDir(rootfs + "/root", 0755) && ensureDir(rootfs + "/root/.npm", 0755)) {
+            if (mount(SHARED_NPM_CACHE, (rootfs + "/root/.npm").c_str(), nullptr, MS_BIND, nullptr) !=
+                0) {
+                PLOG(WARNING) << "bind mount npm cache failed";
+            }
+        }
+    }
+    if (stat(SHARED_OPENCLAW_DEV, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (ensureDir(rootfs + "/opt", 0755) && ensureDir(rootfs + "/opt/openclaw-dev", 0755)) {
+            if (mount(SHARED_OPENCLAW_DEV, (rootfs + "/opt/openclaw-dev").c_str(), nullptr,
+                      MS_BIND, nullptr) != 0) {
+                PLOG(WARNING) << "bind mount openclaw-dev failed";
+            }
+        }
+    }
     return true;
 }
 
-int ContainerManager::forkIntoContainer(const std::string& rootfs,
-                                        const char* const argv[],
-                                        bool usePty) {
+int ContainerManager::forkIntoContainer(const std::string& containerName, const std::string& rootfs,
+                                       const char* const argv[], bool usePty) {
     int masterFd = -1;
     int pipeFds[2] = {-1, -1};
 
-    if (usePty) {
-        // Nothing here; forkpty below handles it.
-    } else {
+    if (!usePty) {
         if (pipe(pipeFds) < 0) {
             PLOG(ERROR) << "pipe";
             return -1;
@@ -366,6 +500,9 @@ int ContainerManager::forkIntoContainer(const std::string& rootfs,
         tryUnshareMountNs();
         if (!setupBindMounts(rootfs)) {
             _exit(125);
+        }
+        if (!mCgroup_.joinContainerCgroup(containerName, getpid())) {
+            LOG(WARNING) << "cgroup join failed for shell";
         }
 
         if (chroot(rootfs.c_str()) != 0) {
@@ -390,17 +527,14 @@ int ContainerManager::forkIntoContainer(const std::string& rootfs,
         _exit(127);
     }
 
-    // Parent.
     if (usePty) {
         return masterFd;
-    } else {
-        close(pipeFds[1]);
-        return pipeFds[0];  // Caller reads from this fd.
     }
+    close(pipeFds[1]);
+    return pipeFds[0];
 }
 
-ExecResult ContainerManager::execSync(const std::string& name,
-                                      const std::string& command,
+ExecResult ContainerManager::execSync(const std::string& name, const std::string& command,
                                       int timeoutMs) {
     ExecResult result{-1, "", ""};
     std::string rootfs = rootfsPath(name);
@@ -442,6 +576,10 @@ ExecResult ContainerManager::execSync(const std::string& name,
             write(stderrPipe[1], msg, strlen(msg));
             _exit(125);
         }
+        if (!mCgroup_.joinContainerCgroup(name, getpid())) {
+            const char* msg = "aohp-containerd: cgroup join failed\n";
+            write(stderrPipe[1], msg, strlen(msg));
+        }
 
         if (chroot(rootfs.c_str()) != 0) {
             _exit(126);
@@ -458,8 +596,6 @@ ExecResult ContainerManager::execSync(const std::string& name,
         close(stdoutPipe[1]);
         close(stderrPipe[1]);
 
-        // Persist cwd across execSync invocations (each command is a new sh; without this,
-        // "cd sdcard" appears to do nothing).
         setenv("AOHP_WD", workDir.c_str(), 1);
         setenv("AOHP_CMD", command.c_str(), 1);
         const char* argv[] = {
@@ -494,7 +630,6 @@ ExecResult ContainerManager::execSync(const std::string& name,
 
     int status = 0;
     if (timeoutMs > 0) {
-        // Simple alarm-based timeout.
         alarm(timeoutMs / 1000 + 1);
     }
     waitpid(pid, &status, 0);
@@ -525,7 +660,282 @@ int ContainerManager::openShell(const std::string& name) {
     }
 
     const char* argv[] = {"/bin/sh", "-l", nullptr};
-    return forkIntoContainer(rootfs, argv, true);
+    return forkIntoContainer(name, rootfs, argv, true);
+}
+
+std::string ContainerManager::templateInfo(const std::string& name) {
+    return readTemplateRecord(name);
+}
+
+bool ContainerManager::isValidServiceId(const std::string& id) {
+    if (id.empty() || id.size() > 64) return false;
+    for (char c : id) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+long ContainerManager::startService(const std::string& name, const std::string& serviceId,
+                                    const std::string& command) {
+    mLastError_.clear();
+    if (!isValidServiceId(serviceId)) {
+        mLastError_ = "invalid serviceId";
+        return -1;
+    }
+    std::string rootfs = rootfsPath(name);
+    struct stat st;
+    if (stat(rootfs.c_str(), &st) != 0) {
+        mLastError_ = "Container not found";
+        return -1;
+    }
+
+    std::string sdir = servicesDirPath(name);
+    if (!ensureDir(sdir, 0755)) {
+        mLastError_ = "mkdir services failed";
+        return -1;
+    }
+
+    std::string pidPath = sdir + "/" + serviceId + ".pid";
+    std::string logPath = sdir + "/" + serviceId + ".log";
+    std::string metaPath = sdir + "/" + serviceId + ".meta";
+
+    if (stat(logPath.c_str(), &st) == 0 && st.st_size > kLogRotateBytes) {
+        truncate(logPath.c_str(), 0);
+    }
+
+    int syncPipe[2];
+    if (pipe(syncPipe) != 0) {
+        mLastError_ = "pipe failed";
+        return -1;
+    }
+
+    pid_t pid1 = fork();
+    if (pid1 < 0) {
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        mLastError_ = "fork failed";
+        return -1;
+    }
+
+    if (pid1 == 0) {
+        close(syncPipe[0]);
+        if (setsid() < 0) {
+            PLOG(ERROR) << "setsid";
+            _exit(1);
+        }
+        pid_t pid2 = fork();
+        if (pid2 < 0) {
+            _exit(1);
+        }
+        if (pid2 == 0) {
+            close(syncPipe[1]);
+            tryUnshareMountNs();
+            if (!setupBindMounts(rootfs)) {
+                _exit(125);
+            }
+            if (!mCgroup_.joinContainerCgroup(name, getpid())) {
+                LOG(WARNING) << "service cgroup join failed";
+            }
+            int logfd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (logfd >= 0) {
+                dup2(logfd, STDOUT_FILENO);
+                dup2(logfd, STDERR_FILENO);
+                if (logfd > STDERR_FILENO) close(logfd);
+            }
+            if (chroot(rootfs.c_str()) != 0) {
+                _exit(126);
+            }
+            chdir("/");
+            setenv("HOME", "/root", 1);
+            setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+            setenv("TERM", "xterm-256color", 1);
+            setenv("LANG", "C.UTF-8", 1);
+            const char* argv[] = {"/bin/sh", "-c", command.c_str(), nullptr};
+            execvp(argv[0], const_cast<char* const*>(argv));
+            _exit(127);
+        }
+
+        std::string pidStr = std::to_string(static_cast<int>(pid2));
+        int pfd = open(pidPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (pfd >= 0) {
+            write(pfd, pidStr.c_str(), pidStr.size());
+            write(pfd, "\n", 1);
+            close(pfd);
+        }
+        long long t = static_cast<long long>(time(nullptr));
+        std::string meta = std::string("{\"serviceId\":\"") + jsonEscape(serviceId) +
+                           "\",\"pid\":" + pidStr + ",\"startTime\":" + std::to_string(t) +
+                           ",\"command\":\"" + jsonEscape(command) + "\"}";
+        int mfd = open(metaPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (mfd >= 0) {
+            write(mfd, meta.c_str(), meta.size());
+            write(mfd, "\n", 1);
+            close(mfd);
+        }
+        char one = 1;
+        write(syncPipe[1], &one, 1);
+        close(syncPipe[1]);
+        _exit(0);
+    }
+
+    close(syncPipe[1]);
+    char buf[1];
+    read(syncPipe[0], buf, sizeof(buf));
+    close(syncPipe[0]);
+    waitpid(pid1, nullptr, 0);
+
+    std::ifstream pin(pidPath.c_str());
+    std::string line;
+    long outPid = -1;
+    if (std::getline(pin, line)) {
+        outPid = strtol(line.c_str(), nullptr, 10);
+    }
+    return outPid;
+}
+
+bool ContainerManager::stopService(const std::string& name, const std::string& serviceId) {
+    if (!isValidServiceId(serviceId)) return false;
+    std::string pidPath = servicesDirPath(name) + "/" + serviceId + ".pid";
+    std::ifstream in(pidPath.c_str());
+    std::string line;
+    if (!std::getline(in, line)) {
+        return false;
+    }
+    pid_t p = static_cast<pid_t>(strtol(line.c_str(), nullptr, 10));
+    if (p <= 1) return false;
+    kill(p, SIGTERM);
+    usleep(500000);
+    if (kill(p, 0) == 0) {
+        kill(p, SIGKILL);
+    }
+    unlink(pidPath.c_str());
+    return true;
+}
+
+std::string ContainerManager::listServicesJson(const std::string& name) {
+    std::string sdir = servicesDirPath(name);
+    DIR* d = opendir(sdir.c_str());
+    if (!d) {
+        return "[]";
+    }
+    std::ostringstream oss;
+    oss << "[";
+    bool first = true;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        std::string fn(e->d_name);
+        if (fn.size() <= 5 || fn.substr(fn.size() - 5) != ".meta") continue;
+        std::string sid = fn.substr(0, fn.size() - 5);
+        std::string metaPath = sdir + "/" + fn;
+        std::ifstream min(metaPath.c_str());
+        std::string metaJson;
+        if (std::getline(min, metaJson)) {
+            metaJson = android::base::Trim(metaJson);
+        }
+        std::string pidPath = sdir + "/" + sid + ".pid";
+        std::ifstream pin(pidPath.c_str());
+        std::string pline;
+        int pid = -1;
+        if (std::getline(pin, pline)) {
+            pid = static_cast<int>(strtol(pline.c_str(), nullptr, 10));
+        }
+        bool alive = (pid > 0 && kill(static_cast<pid_t>(pid), 0) == 0);
+        long long startTime = extractJsonIntField(metaJson, "startTime");
+        long long uptime = 0;
+        if (alive && startTime > 0) {
+            uptime = static_cast<long long>(time(nullptr)) - startTime;
+        }
+        std::string cmd = extractJsonStringField(metaJson, "command");
+        if (!first) oss << ",";
+        first = false;
+        oss << "{\"serviceId\":\"" << jsonEscape(sid) << "\",\"pid\":" << pid
+            << ",\"alive\":" << (alive ? "true" : "false") << ",\"startTime\":" << startTime
+            << ",\"uptimeSec\":" << uptime << ",\"command\":\"" << jsonEscape(cmd) << "\"}";
+    }
+    closedir(d);
+    oss << "]";
+    return oss.str();
+}
+
+std::string ContainerManager::serviceLogTail(const std::string& name, const std::string& serviceId,
+                                               int tailBytes) {
+    if (!isValidServiceId(serviceId)) return "";
+    if (tailBytes <= 0 || tailBytes > 4 * 1024 * 1024) tailBytes = 65536;
+    std::string path = servicesDirPath(name) + "/" + serviceId + ".log";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return "";
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return "";
+    }
+    off_t sz = st.st_size;
+    off_t off = 0;
+    if (sz > tailBytes) {
+        off = sz - tailBytes;
+    }
+    if (lseek(fd, off, SEEK_SET) < 0) {
+        close(fd);
+        return "";
+    }
+    std::string out;
+    out.resize(static_cast<size_t>(sz - off));
+    ssize_t n = read(fd, &out[0], out.size());
+    close(fd);
+    if (n < 0) return "";
+    out.resize(static_cast<size_t>(n));
+    return out;
+}
+
+std::string ContainerManager::getUsageJson(const std::string& name) {
+    return mCgroup_.getUsageJson(name);
+}
+
+std::string ContainerManager::diagnose(const std::string& name) {
+    std::string tpl = readTemplateRecord(name);
+    std::string cg = mCgroup_.diagnoseJson(name);
+    struct stat st;
+    bool npmHost = stat(SHARED_NPM_CACHE, &st) == 0 && S_ISDIR(st.st_mode);
+    bool devHost = stat(SHARED_OPENCLAW_DEV, &st) == 0 && S_ISDIR(st.st_mode);
+    std::string rootfs = rootfsPath(name);
+    bool rootfsOk = stat(rootfs.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    std::ostringstream oss;
+    oss << "{\"container\":\"" << jsonEscape(name) << "\",\"template\":\"" << jsonEscape(tpl)
+        << "\",\"rootfsExists\":" << (rootfsOk ? "true" : "false") << ",\"npmCacheHostDir\":"
+        << (npmHost ? "true" : "false") << ",\"openclawDevHostDir\":" << (devHost ? "true" : "false")
+        << ",\"cgroup\":" << cg << "}";
+    return oss.str();
+}
+
+void ContainerManager::adoptOrphanServicePids() {
+    std::vector<std::string> envs = listContainers();
+    for (const auto& name : envs) {
+        std::string sdir = servicesDirPath(name);
+        DIR* d = opendir(sdir.c_str());
+        if (!d) continue;
+        struct dirent* e;
+        while ((e = readdir(d)) != nullptr) {
+            std::string fn(e->d_name);
+            if (fn.size() <= 4 || fn.substr(fn.size() - 4) != ".pid") continue;
+            std::string path = sdir + "/" + fn;
+            std::ifstream in(path.c_str());
+            std::string line;
+            if (!std::getline(in, line)) continue;
+            int pid = static_cast<int>(strtol(line.c_str(), nullptr, 10));
+            if (pid <= 1) {
+                unlink(path.c_str());
+                continue;
+            }
+            if (kill(static_cast<pid_t>(pid), 0) != 0) {
+                LOG(INFO) << "Removing stale pid file " << path << " for dead pid " << pid;
+                unlink(path.c_str());
+            }
+        }
+        closedir(d);
+    }
 }
 
 }  // namespace aohp
