@@ -202,11 +202,17 @@ void CgroupController::destroyForContainer(const std::string& containerName) {
 
 bool CgroupController::joinContainerCgroup(const std::string& containerName, pid_t pid) {
     if (!mEnabled_ || !mV2Detected_) return true;  // no-op
-    std::string path = cgroupPathFor(containerName) + "/cgroup.procs";
+    std::string cg = cgroupPathFor(containerName);
+    struct stat st;
+    if (stat(cg.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        // createForContainer failed or cgroup not present — run without per-env limits.
+        return true;
+    }
+    std::string path = cg + "/cgroup.procs";
     std::string s = std::to_string(static_cast<int>(pid)) + "\n";
     if (!writeFile(path, s)) {
+        // Common on devices where root cgroup did not delegate +cpu/+pids to children.
         PLOG(WARNING) << "join cgroup failed " << path;
-        return false;
     }
     return true;
 }

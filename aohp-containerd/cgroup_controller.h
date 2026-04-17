@@ -29,7 +29,7 @@ public:
     /** Remove cgroup directory (processes must already be gone). */
     void destroyForContainer(const std::string& containerName);
 
-    /** Move pid into this container's cgroup (must run before chroot in child). */
+    /** Best-effort: move pid into this container's cgroup before chroot (logs on failure; always ok to continue). */
     bool joinContainerCgroup(const std::string& containerName, pid_t pid);
 
     /** JSON: memoryCurrent, memoryMax, memoryPeak, cpuUsageUsec, pidsCurrent, cgroupPath */

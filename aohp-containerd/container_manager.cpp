@@ -501,9 +501,7 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
         if (!setupBindMounts(rootfs)) {
             _exit(125);
         }
-        if (!mCgroup_.joinContainerCgroup(containerName, getpid())) {
-            LOG(WARNING) << "cgroup join failed for shell";
-        }
+        mCgroup_.joinContainerCgroup(containerName, getpid());
 
         if (chroot(rootfs.c_str()) != 0) {
             PLOG(ERROR) << "chroot " << rootfs;
@@ -576,10 +574,8 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
             write(stderrPipe[1], msg, strlen(msg));
             _exit(125);
         }
-        if (!mCgroup_.joinContainerCgroup(name, getpid())) {
-            const char* msg = "aohp-containerd: cgroup join failed\n";
-            write(stderrPipe[1], msg, strlen(msg));
-        }
+        // Best-effort cgroup; failures are logged inside joinContainerCgroup (never stderr).
+        mCgroup_.joinContainerCgroup(name, getpid());
 
         if (chroot(rootfs.c_str()) != 0) {
             _exit(126);
@@ -736,9 +732,7 @@ long ContainerManager::startService(const std::string& name, const std::string& 
             if (!setupBindMounts(rootfs)) {
                 _exit(125);
             }
-            if (!mCgroup_.joinContainerCgroup(name, getpid())) {
-                LOG(WARNING) << "service cgroup join failed";
-            }
+            mCgroup_.joinContainerCgroup(name, getpid());
             int logfd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (logfd >= 0) {
                 dup2(logfd, STDOUT_FILENO);
