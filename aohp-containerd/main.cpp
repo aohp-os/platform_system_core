@@ -130,8 +130,16 @@ static void handleClient(int clientFd) {
 
         } else if (cmd == CMD_DESTROY && tokens.size() >= 2) {
             bool ok = gMgr.destroyContainer(tokens[1]);
-            response = ok ? std::string(RESP_OK) + " destroyed\n"
-                          : std::string(RESP_ERR) + " destroy failed\n";
+            if (ok) {
+                response = std::string(RESP_OK) + " destroyed\n";
+            } else {
+                std::string detail = gMgr.getLastError();
+                for (char& c : detail) {
+                    if (c == '\n' || c == '\r') c = ' ';
+                }
+                if (detail.empty()) detail = "destroy failed";
+                response = std::string(RESP_ERR) + " " + detail + "\n";
+            }
 
         } else if (cmd == CMD_RESET && tokens.size() >= 2) {
             bool ok = gMgr.resetContainer(tokens[1]);

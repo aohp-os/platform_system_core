@@ -18,7 +18,11 @@
 #include <fstream>
 #include <sstream>
 
+#include <algorithm>
+#include <vector>
+
 #include <dirent.h>
+#include <mntent.h>
 #include <fcntl.h>
 #include <pty.h>
 #include <sched.h>
@@ -70,6 +74,30 @@ void tryUnshareMountNs() {
     if (unshare(CLONE_NEWNS) != 0) {
         PLOG(WARNING) << "unshare(CLONE_NEWNS) failed, using host mount namespace";
     }
+}
+
+// Node/V8 allocates RW->RX pages for JIT by default. On some Android / hardened
+// kernels those mmaps fail (V8 CHECK: errno 12 ENOMEM). --jitless avoids runtime
+// executable mappings; fine for the bundled aohp CLI in AOHP containers.
+void setContainerNodeOptionsJitless() {
+    const char* existing = getenv("NODE_OPTIONS");
+    // --jitless: avoid executable mmap failures on hardened/Android environments.
+    // --no-warnings: suppress V8 noise when --jitless disables --expose_wasm (harmless).
+    std::string merged = "--jitless --no-warnings";
+    if (existing != nullptr && existing[0] != '\0') {
+        merged = std::string(existing) + " --jitless --no-warnings";
+    }
+    setenv("NODE_OPTIONS", merged.c_str(), 1);
+}
+
+void setContainerChildCommonEnv() {
+    setenv("HOME", "/root", 1);
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("TERM", "xterm-256color", 1);
+    setenv("LANG", "C.UTF-8", 1);
+    // Quiets Node/V8 noise (e.g. --jitless vs default --expose_wasm) without hiding user code warnings.
+    setenv("NODE_NO_WARNINGS", "1", 0);
+    setContainerNodeOptionsJitless();
 }
 
 std::string jsonEscape(const std::string& s) {
@@ -305,6 +333,38 @@ static int removePathRecursive(const std::string& path) {
 
 static int recursiveRemove(const std::string& path) { return removePathRecursive(path); }
 
+/** Unmount every mount point under {@code rootfs} (deepest first). Needed when fixed-path
+ *  teardownBindMounts misses a bind mount or a previous umount failed — otherwise rmdir(rootfs)
+ *  fails with EBUSY/ENOTEMPTY. */
+static void umountAllUnderRootfs(const std::string& rootfs) {
+    if (rootfs.empty()) return;
+    FILE* fp = setmntent("/proc/mounts", "r");
+    if (!fp) {
+        PLOG(WARNING) << "setmntent /proc/mounts";
+        return;
+    }
+    std::vector<std::string> mounts;
+    struct mntent* e;
+    while ((e = getmntent(fp)) != nullptr) {
+        std::string mp(e->mnt_dir);
+        if (mp.empty()) continue;
+        if (mp == rootfs ||
+            (mp.size() > rootfs.size() && mp[rootfs.size()] == '/' &&
+             mp.compare(0, rootfs.size(), rootfs) == 0)) {
+            mounts.push_back(std::move(mp));
+        }
+    }
+    endmntent(fp);
+    std::sort(mounts.begin(), mounts.end(), [](const std::string& a, const std::string& b) {
+        return a.size() > b.size();
+    });
+    for (const auto& mp : mounts) {
+        if (umount2(mp.c_str(), MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
+            PLOG(WARNING) << "umount2 " << mp;
+        }
+    }
+}
+
 void ContainerManager::killContainerProcesses(const std::string& rootfs) {
     DIR* proc = opendir("/proc");
     if (!proc) return;
@@ -350,6 +410,7 @@ bool ContainerManager::teardownBindMounts(const std::string& rootfs) {
 }
 
 bool ContainerManager::destroyContainer(const std::string& name) {
+    mLastError_.clear();
     {
         std::lock_guard<std::mutex> lock(mWorkDirMutex_);
         mWorkDir_.erase(name);
@@ -357,12 +418,26 @@ bool ContainerManager::destroyContainer(const std::string& name) {
     std::string rootfs = rootfsPath(name);
     std::string env = envPath(name);
 
-    killContainerProcesses(rootfs);
-    teardownBindMounts(rootfs);
-    mCgroup_.destroyForContainer(name);
+    bool removed = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (attempt > 0) {
+            usleep(200000);
+        }
+        killContainerProcesses(rootfs);
+        teardownBindMounts(rootfs);
+        umountAllUnderRootfs(rootfs);
+        mCgroup_.destroyForContainer(name);
 
-    if (recursiveRemove(env) != 0) {
-        LOG(ERROR) << "Failed to remove " << env;
+        if (recursiveRemove(env) == 0) {
+            removed = true;
+            break;
+        }
+        PLOG(WARNING) << "destroyContainer: recursiveRemove failed attempt " << (attempt + 1) << " for "
+                      << env;
+    }
+    if (!removed) {
+        mLastError_ = "Failed to remove " + env + " (busy mount or unreleased file; check logcat aohp-containerd)";
+        LOG(ERROR) << mLastError_;
         return false;
     }
     LOG(INFO) << "Container " << name << " destroyed";
@@ -379,7 +454,11 @@ bool ContainerManager::resetContainer(const std::string& name) {
 
     killContainerProcesses(rootfs);
     teardownBindMounts(rootfs);
-    recursiveRemove(rootfs);
+    umountAllUnderRootfs(rootfs);
+    if (recursiveRemove(rootfs) != 0) {
+        LOG(ERROR) << "reset: failed to remove rootfs " << rootfs;
+        return false;
+    }
 
     std::string tpl;
     std::string recorded = readTemplateRecord(name);
@@ -509,10 +588,7 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
         }
         chdir("/");
 
-        setenv("HOME", "/root", 1);
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-        setenv("TERM", "xterm-256color", 1);
-        setenv("LANG", "C.UTF-8", 1);
+        setContainerChildCommonEnv();
 
         if (!usePty) {
             close(pipeFds[0]);
@@ -582,10 +658,7 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
         }
         chdir("/");
 
-        setenv("HOME", "/root", 1);
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-        setenv("TERM", "xterm-256color", 1);
-        setenv("LANG", "C.UTF-8", 1);
+        setContainerChildCommonEnv();
 
         dup2(stdoutPipe[1], STDOUT_FILENO);
         dup2(stderrPipe[1], STDERR_FILENO);
@@ -743,10 +816,7 @@ long ContainerManager::startService(const std::string& name, const std::string& 
                 _exit(126);
             }
             chdir("/");
-            setenv("HOME", "/root", 1);
-            setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-            setenv("TERM", "xterm-256color", 1);
-            setenv("LANG", "C.UTF-8", 1);
+            setContainerChildCommonEnv();
             const char* argv[] = {"/bin/sh", "-c", command.c_str(), nullptr};
             execvp(argv[0], const_cast<char* const*>(argv));
             _exit(127);
