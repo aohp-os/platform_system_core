@@ -73,6 +73,17 @@ bool ensureDir(const std::string& path, mode_t mode) {
 void tryUnshareMountNs() {
     if (unshare(CLONE_NEWNS) != 0) {
         PLOG(WARNING) << "unshare(CLONE_NEWNS) failed, using host mount namespace";
+        return;
+    }
+    // A freshly unshared mount namespace inherits MS_SHARED propagation on most mounts.
+    // Without flipping the root to MS_SLAVE (same trick zygote / init's SetUpMountNamespace
+    // uses), every bind mount in this child — /proc, /dev, /sys, /sdcard, and especially
+    // each `newinstance` devpts — propagates back to the host namespace and survives the
+    // child's exit. After ~10 execSyncs the host accumulates dozens of stale mounts plus a
+    // new devpts instance each time, which bogs down the whole VM and eventually makes
+    // setupBindMounts() fail for all subsequent commands.
+    if (mount("rootfs", "/", nullptr, MS_SLAVE | MS_REC, nullptr) != 0) {
+        PLOG(WARNING) << "make-rslave / failed; child mounts may leak to host namespace";
     }
 }
 
