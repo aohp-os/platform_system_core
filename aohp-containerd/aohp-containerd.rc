@@ -5,6 +5,7 @@ on post-fs-data
     mkdir /data/aohp/shared 0770 root system
     mkdir /data/aohp/shared/npm-cache 0770 root system
     mkdir /data/aohp/shared/openclaw-dev 0770 root system
+    mkdir /data/aohp/shared/uda 0770 root system
     restorecon_recursive /data/aohp
 
 service aohp-containerd /system/bin/aohp-containerd

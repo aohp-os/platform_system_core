@@ -173,6 +173,7 @@ ContainerManager::ContainerManager() {
     mkdir(SHARED_BASE, 0770);
     mkdir(SHARED_NPM_CACHE, 0770);
     mkdir(SHARED_OPENCLAW_DEV, 0770);
+    mkdir(SHARED_UDA, 0770);
     mCgroup_.loadConfig(AOHP_CGROUP_CONF);
 }
 
@@ -401,6 +402,8 @@ void ContainerManager::killContainerProcesses(const std::string& rootfs) {
 
 bool ContainerManager::teardownBindMounts(const std::string& rootfs) {
     const char* mounts[] = {
+            "/etc/resolv.conf",
+            "/opt/udagen/workspace",
             "/opt/openclaw-dev",
             "/root/.npm",
             "/proc",
@@ -556,6 +559,25 @@ bool ContainerManager::setupBindMounts(const std::string& rootfs) {
             if (mount(SHARED_OPENCLAW_DEV, (rootfs + "/opt/openclaw-dev").c_str(), nullptr,
                       MS_BIND, nullptr) != 0) {
                 PLOG(WARNING) << "bind mount openclaw-dev failed";
+            }
+        }
+    }
+    if (stat(SHARED_UDA, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (ensureDir(rootfs + "/opt/udagen", 0755) &&
+            ensureDir(rootfs + "/opt/udagen/workspace", 0755)) {
+            if (mount(SHARED_UDA, (rootfs + "/opt/udagen/workspace").c_str(), nullptr, MS_BIND,
+                      nullptr) != 0) {
+                PLOG(WARNING) << "bind mount uda workspace failed";
+            }
+        }
+    }
+    // Use Android host DNS (netd on 127.0.0.1); template resolv.conf (8.8.8.8) often fails in chroot.
+    if (stat("/etc/resolv.conf", &st) == 0 && S_ISREG(st.st_mode)) {
+        std::string target = rootfs + "/etc/resolv.conf";
+        if (ensureDir(rootfs + "/etc", 0755)) {
+            if (mount("/etc/resolv.conf", target.c_str(), nullptr, MS_BIND | MS_RDONLY,
+                      nullptr) != 0) {
+                PLOG(WARNING) << "bind mount resolv.conf failed";
             }
         }
     }

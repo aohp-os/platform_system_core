@@ -33,6 +33,7 @@ constexpr const char* TEMPLATE_DIR       = "/system/etc/aohp/rootfs-templates";
 constexpr const char* SHARED_BASE           = "/data/aohp/shared";
 constexpr const char* SHARED_NPM_CACHE      = "/data/aohp/shared/npm-cache";
 constexpr const char* SHARED_OPENCLAW_DEV   = "/data/aohp/shared/openclaw-dev";
+constexpr const char* SHARED_UDA            = "/data/aohp/shared/uda";
 constexpr const char* AOHP_CGROUP_CONF      = "/system/etc/aohp/cgroup.conf";
 
 constexpr const char* CMD_TEMPLATE_INFO = "TEMPLATE_INFO";
